@@ -65,6 +65,46 @@ class QueueView(HeadEstimate):
     jobs: list[JobView]
 
 
+HISTORY_EVENT_TYPES = Literal[
+    "queued", "waiting", "dispatched", "released", "expired"
+]
+
+HISTORY_BLOCKED_REASONS = Literal[
+    "waiting_for_free_slots",
+    "insufficient_capacity",
+    "no_nodes_configured",
+    "queued_behind_head",
+]
+
+
+class HistoryEvent(BaseModel):
+    seq: int
+    event_type: HISTORY_EVENT_TYPES
+    status: STATUS_LITERAL
+    occurred_at: str
+    queue_position: int | None
+    blocked_reason: HISTORY_BLOCKED_REASONS | None
+    node_id: str | None
+    slots: int | None
+    lease_expires_at: str | None
+
+
+class JobHistory(BaseModel):
+    job_id: str
+    events: list[HistoryEvent]
+
+
+class FaultInjectionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    # N > 0: the next N dispatch attempts fail.  0: disarm.
+    dispatch_failures: int = Field(ge=0, le=1000)
+
+
+class FaultInjectionView(BaseModel):
+    armed_dispatch_failures: int
+
+
 class SchedulerEvent(BaseModel):
     type: Literal["dispatched", "expired"]
     job_id: str

@@ -34,6 +34,21 @@ US_PER_SECOND = 1_000_000
 
 JOB_STATUSES = ("queued", "running", "completed", "expired")
 
+# Blocked-reason vocabulary.  The first three are also used by the queue
+# head estimate; ``queued_behind_head`` only appears in the scheduling
+# history, for non-head jobs held back by the blocked head.
+REASON_WAITING_FOR_SLOTS = "waiting_for_free_slots"
+REASON_INSUFFICIENT_CAPACITY = "insufficient_capacity"
+REASON_NO_NODES = "no_nodes_configured"
+REASON_QUEUED_BEHIND_HEAD = "queued_behind_head"
+
+# History event types.
+EVENT_QUEUED = "queued"
+EVENT_WAITING = "waiting"
+EVENT_DISPATCHED = "dispatched"
+EVENT_RELEASED = "released"
+EVENT_EXPIRED = "expired"
+
 
 # ---------------------------------------------------------------------------
 # Errors (mapped to HTTP status codes by the API layer)
@@ -122,6 +137,9 @@ class Scheduler:
         self.clock = clock
         self.tick_seconds = tick_seconds
         self._lock = threading.RLock()
+        # Demo/testing aid: when > 0, the next dispatch attempts raise
+        # inside their transaction (see arm_dispatch_failures).
+        self._pending_dispatch_failures = 0
 
     # -- time -------------------------------------------------------------
 
@@ -192,6 +210,18 @@ class Scheduler:
                             f"job {job_id!r} already exists"
                         ) from exc
                     raise
+                # The submission and its history row commit together.
+                position = conn.execute(
+                    "SELECT COUNT(*) AS n FROM jobs WHERE status = 'queued'"
+                ).fetchone()["n"]
+                self._record_event(
+                    conn,
+                    job_id,
+                    EVENT_QUEUED,
+                    "queued",
+                    now,
+                    queue_position=position,
+                )
             # The job is committed as queued even if the immediate dispatch
             # pass fails; the periodic reconciliator retries.
             self._try_schedule()
@@ -207,7 +237,8 @@ class Scheduler:
         error: SchedulerError | None = None
         with self._lock:
             with self.store.transaction() as conn:
-                self._expire_due(conn, self.now_us(), events=[])
+                now = self.now_us()
+                self._expire_due(conn, now, events=[])
                 row = conn.execute(
                     "SELECT * FROM jobs WHERE job_id = ?", (job_id,)
                 ).fetchone()
@@ -224,7 +255,17 @@ class Scheduler:
                         UPDATE jobs SET status = 'completed', ended_at_us = ?
                         WHERE seq = ? AND status = 'running'
                         """,
-                        (self.now_us(), row["seq"]),
+                        (now, row["seq"]),
+                    )
+                    # The release and its history row commit together.
+                    self._record_event(
+                        conn,
+                        job_id,
+                        EVENT_RELEASED,
+                        "completed",
+                        now,
+                        node_id=row["assigned_node"],
+                        slots=row["required_slots"],
                     )
             # Re-dispatch even when the release request itself was rejected:
             # the expiry sweep inside the transaction may have freed slots.
@@ -238,6 +279,18 @@ class Scheduler:
     def tick(self) -> list[dict]:
         """Expire due leases and dispatch everything currently eligible."""
         return self._try_schedule()
+
+    def arm_dispatch_failures(self, count: int) -> int:
+        """Demo/testing aid: make the next ``count`` dispatch attempts fail.
+
+        The failure is raised inside the scheduling transaction, so the
+        pass rolls back with no state change and no history rows; the
+        following pass retries normally.  Returns the number of dispatch
+        failures now armed.
+        """
+        with self._lock:
+            self._pending_dispatch_failures = max(0, int(count))
+            return self._pending_dispatch_failures
 
     def get_node(self, node_id: str) -> dict:
         with self._lock:
@@ -309,6 +362,33 @@ class Scheduler:
                 ]
                 return estimate
 
+    def job_history(self, job_id: str, limit: int = 200) -> dict:
+        """Scheduling history of one job, oldest event first.
+
+        The history is persisted in SQLite, so it survives restarts and is
+        consistent with the job's current state: every row was committed
+        in the same transaction as the change it records.
+        """
+        with self._lock:
+            self._try_schedule()
+            with self.store.transaction() as conn:
+                row = conn.execute(
+                    "SELECT job_id FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                if row is None:
+                    raise JobNotFoundError(f"job {job_id!r} not found")
+                rows = conn.execute(
+                    """
+                    SELECT * FROM job_events WHERE job_id = ?
+                    ORDER BY seq LIMIT ?
+                    """,
+                    (job_id, limit),
+                ).fetchall()
+                return {
+                    "job_id": job_id,
+                    "events": [self._event_dict(event) for event in rows],
+                }
+
     # -- scheduling core --------------------------------------------------
 
     def _try_schedule(self) -> list[dict]:
@@ -344,6 +424,17 @@ class Scheduler:
                 WHERE seq = ? AND status = 'running'
                 """,
                 (job.seq,),
+            )
+            # Same transaction as the status change: a rolled-back sweep
+            # leaves no orphaned expiry record.
+            self._record_event(
+                conn,
+                job.job_id,
+                EVENT_EXPIRED,
+                "expired",
+                job.expires_at_us,
+                node_id=job.assigned_node,
+                slots=job.required_slots,
             )
             events.append(
                 {
@@ -455,6 +546,11 @@ class Scheduler:
                     queued.remove(candidate)
             break
 
+        if queued:
+            # Record where each still-queued job sits and why it is blocked,
+            # in the same transaction as the pass itself.
+            self._record_waiting_events(conn, queued, capacities, now_us)
+
         return events
 
     @staticmethod
@@ -542,6 +638,13 @@ class Scheduler:
         available: dict[str, int],
         events: list[dict],
     ) -> None:
+        if self._pending_dispatch_failures > 0:
+            # Fault-injection demo hook: raise inside the transaction so
+            # the whole pass (including any history rows) rolls back.
+            self._pending_dispatch_failures -= 1
+            raise RuntimeError(
+                f"injected dispatch failure for job {job.job_id!r}"
+            )
         if available.get(node_id, 0) < job.required_slots:
             raise RuntimeError(
                 f"refusing to oversubscribe node {node_id!r} with job "
@@ -562,6 +665,18 @@ class Scheduler:
             raise RuntimeError(
                 f"job {job.job_id!r} was not queued at allocation time"
             )
+        # Same transaction as the allocation: no dispatch without its
+        # history row, and no history row without the dispatch.
+        self._record_event(
+            conn,
+            job.job_id,
+            EVENT_DISPATCHED,
+            "running",
+            now_us,
+            node_id=node_id,
+            slots=job.required_slots,
+            lease_expires_at_us=expires_at,
+        )
         running_by_node.setdefault(node_id, []).append(
             replace(
                 job,
@@ -582,6 +697,115 @@ class Scheduler:
                 "lease_expires_at": to_iso(expires_at),
             }
         )
+
+    # -- scheduling history -----------------------------------------------
+
+    @staticmethod
+    def _record_event(
+        conn: sqlite3.Connection,
+        job_id: str,
+        event_type: str,
+        status: str,
+        occurred_at_us: int,
+        *,
+        queue_position: int | None = None,
+        blocked_reason: str | None = None,
+        node_id: str | None = None,
+        slots: int | None = None,
+        lease_expires_at_us: int | None = None,
+    ) -> None:
+        """Append one history row inside the caller's transaction."""
+        conn.execute(
+            """
+            INSERT INTO job_events
+                (job_id, event_type, status, occurred_at_us, queue_position,
+                 blocked_reason, node_id, slots, lease_expires_at_us)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                job_id,
+                event_type,
+                status,
+                occurred_at_us,
+                queue_position,
+                blocked_reason,
+                node_id,
+                slots,
+                lease_expires_at_us,
+            ),
+        )
+
+    def _record_waiting_events(
+        self,
+        conn: sqlite3.Connection,
+        queued: list[JobRecord],
+        capacities: dict[str, int],
+        now_us: int,
+    ) -> None:
+        """Record the queue position and blocked reason of waiting jobs.
+
+        One ``waiting`` row per job per pass, except that a row is skipped
+        when it repeats the job's latest ``waiting`` row (same position and
+        same reason): consecutive retries of an unchanged situation must
+        not spam the history.
+        """
+        placeholders = ", ".join("?" for _ in queued)
+        latest: dict[str, tuple[int | None, str | None]] = {}
+        for row in conn.execute(
+            f"""
+            SELECT job_id, queue_position, blocked_reason
+            FROM job_events
+            WHERE event_type = 'waiting' AND job_id IN ({placeholders})
+            ORDER BY seq
+            """,
+            [job.job_id for job in queued],
+        ).fetchall():
+            latest[row["job_id"]] = (row["queue_position"], row["blocked_reason"])
+
+        max_capacity = max(capacities.values(), default=0)
+        head = queued[0]
+        # When the head is simply short of free slots, later jobs are held
+        # back by the head's reservation; otherwise (no nodes, or a head
+        # that can never fit) a still-queued job is itself short of slots.
+        head_waits_for_slots = (
+            bool(capacities) and head.required_slots <= max_capacity
+        )
+        for position, job in enumerate(queued, start=1):
+            if not capacities:
+                reason = REASON_NO_NODES
+            elif job.required_slots > max_capacity:
+                reason = REASON_INSUFFICIENT_CAPACITY
+            elif position == 1:
+                reason = REASON_WAITING_FOR_SLOTS
+            elif head_waits_for_slots:
+                reason = REASON_QUEUED_BEHIND_HEAD
+            else:
+                reason = REASON_WAITING_FOR_SLOTS
+            if latest.get(job.job_id) == (position, reason):
+                continue
+            self._record_event(
+                conn,
+                job.job_id,
+                EVENT_WAITING,
+                "queued",
+                now_us,
+                queue_position=position,
+                blocked_reason=reason,
+            )
+
+    @staticmethod
+    def _event_dict(row: sqlite3.Row) -> dict:
+        return {
+            "seq": row["seq"],
+            "event_type": row["event_type"],
+            "status": row["status"],
+            "occurred_at": to_iso(row["occurred_at_us"]),
+            "queue_position": row["queue_position"],
+            "blocked_reason": row["blocked_reason"],
+            "node_id": row["node_id"],
+            "slots": row["slots"],
+            "lease_expires_at": to_iso(row["lease_expires_at_us"]),
+        }
 
     # -- read helpers -----------------------------------------------------
 
@@ -622,10 +846,10 @@ class Scheduler:
         )
         if earliest is None:
             reason = (
-                "no_nodes_configured" if not capacities else "insufficient_capacity"
+                REASON_NO_NODES if not capacities else REASON_INSUFFICIENT_CAPACITY
             )
         elif earliest > now_us:
-            reason = "waiting_for_free_slots"
+            reason = REASON_WAITING_FOR_SLOTS
         else:
             reason = None
 

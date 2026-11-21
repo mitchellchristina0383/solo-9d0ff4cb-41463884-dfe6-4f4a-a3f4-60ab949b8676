@@ -50,6 +50,32 @@ CREATE INDEX IF NOT EXISTS idx_jobs_node_status
 CREATE INDEX IF NOT EXISTS idx_jobs_status_expiry
     ON jobs (status, expires_at_us);
 
+-- Append-only scheduling history: one row per state change (queued,
+-- dispatched, released, expired) and one row per scheduling pass that
+-- leaves a job waiting (with its queue position and blocked reason at
+-- that moment).  Rows are always inserted inside the same transaction
+-- as the state change they describe, so a rolled-back pass leaves no
+-- orphaned history.
+CREATE TABLE IF NOT EXISTS job_events (
+    seq                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    job_id              TEXT NOT NULL REFERENCES jobs(job_id),
+    event_type          TEXT NOT NULL CHECK (event_type IN
+                            ('queued', 'waiting', 'dispatched', 'released', 'expired')),
+    status              TEXT NOT NULL CHECK (status IN
+                            ('queued', 'running', 'completed', 'expired')),
+    occurred_at_us      INTEGER NOT NULL,
+    queue_position      INTEGER,
+    blocked_reason      TEXT CHECK (blocked_reason IS NULL OR blocked_reason IN
+                            ('waiting_for_free_slots', 'insufficient_capacity',
+                             'no_nodes_configured', 'queued_behind_head')),
+    node_id             TEXT,
+    slots               INTEGER,
+    lease_expires_at_us INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_events_job_seq
+    ON job_events (job_id, seq);
+
 -- Defence in depth: even if a future code path (or a manual statement)
 -- tries to overbook a node, SQLite rejects it.  The scheduler's in-memory
 -- accounting is still the source of allocation decisions; these triggers

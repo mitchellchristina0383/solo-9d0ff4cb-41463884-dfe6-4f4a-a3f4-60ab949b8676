@@ -15,7 +15,10 @@ from fastapi.responses import JSONResponse
 from .db import Store
 from .models import (
     ErrorResponse,
+    FaultInjectionRequest,
+    FaultInjectionView,
     HeadEstimate,
+    JobHistory,
     JobSubmitRequest,
     JobView,
     NodeConfigRequest,
@@ -87,11 +90,14 @@ def create_app(
 
     app = FastAPI(
         title="Render Farm Slot Scheduler",
-        version="1.0.0",
+        version="1.1.0",
         description=(
             "Backfills idle CPU slots for queued render jobs while preserving "
             "queue order. Every job leases all of its slots on one node; "
-            "leases are returned explicitly or expire automatically."
+            "leases are returned explicitly or expire automatically. Every "
+            "state change — and every pass that leaves a job waiting, with "
+            "its queue position and blocked reason — is persisted in a "
+            "per-job scheduling history (`GET /jobs/{job_id}/history`)."
         ),
         lifespan=lifespan,
     )
@@ -190,6 +196,18 @@ def create_app(
     def get_job(job_id: str) -> JobView:
         return JobView(**scheduler.get_job(job_id))
 
+    @app.get(
+        "/jobs/{job_id}/history",
+        response_model=JobHistory,
+        tags=["jobs"],
+        summary="Scheduling history: state changes and waits of one job",
+        responses={404: {"model": ErrorResponse}},
+    )
+    def job_history(
+        job_id: str, limit: int = Query(default=200, ge=1, le=1000)
+    ) -> JobHistory:
+        return JobHistory(**scheduler.job_history(job_id, limit=limit))
+
     @app.post(
         "/jobs/{job_id}/release",
         response_model=JobView,
@@ -229,5 +247,18 @@ def create_app(
     def tick() -> TickResponse:
         events = scheduler.tick()
         return TickResponse(events=[SchedulerEvent(**e) for e in events])
+
+    @app.post(
+        "/admin/fault-injection",
+        response_model=FaultInjectionView,
+        tags=["system"],
+        summary=(
+            "Demo aid: make the next N dispatch attempts fail "
+            "(the pass rolls back, leaving no history)"
+        ),
+    )
+    def inject_fault(payload: FaultInjectionRequest) -> FaultInjectionView:
+        armed = scheduler.arm_dispatch_failures(payload.dispatch_failures)
+        return FaultInjectionView(armed_dispatch_failures=armed)
 
     return app

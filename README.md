@@ -112,10 +112,12 @@ Notes:
 | `POST` | `/jobs` | Submit a job (dispatches immediately if possible) |
 | `GET` | `/jobs?status=` | List jobs in submission order |
 | `GET` | `/jobs/{job_id}` | Status, assigned node, lease expiry, remaining time |
+| `GET` | `/jobs/{job_id}/history` | Scheduling history: state changes and waits |
 | `POST` | `/jobs/{job_id}/release` | Return a running lease early |
 | `GET` | `/queue/head` | Queue head's estimated earliest start |
 | `GET` | `/queue` | Queued jobs plus the head estimate |
 | `POST` | `/admin/tick` | Expire due leases and re-dispatch now |
+| `POST` | `/admin/fault-injection` | Demo aid: make the next N dispatch attempts fail |
 | `GET` | `/healthz` | Liveness + database check |
 
 ### Example walkthrough
@@ -173,14 +175,112 @@ curl -s localhost:8000/jobs/plate-002   # status: running, node: farm-1
 
 ---
 
+## Scheduling history
+
+`/queue` shows the *current* state; `GET /jobs/{job_id}/history` shows how a
+job got there. Every state change is appended to a `job_events` table in the
+same SQLite database, so the history survives restarts and is always
+consistent with the job row:
+
+| `event_type` | Meaning | Extra fields |
+| --- | --- | --- |
+| `queued` | Job submitted | `queue_position` at submit time |
+| `waiting` | A scheduling pass left the job queued | `queue_position`, `blocked_reason` at that moment |
+| `dispatched` | Job started on a node | `node_id`, `slots`, `lease_expires_at` |
+| `released` | Lease returned early (status `completed`) | `node_id`, `slots` |
+| `expired` | Lease ran out (status `expired`) | `node_id`, `slots` |
+
+Rules:
+
+* **Same transaction as the state change.** Dispatch, release, and expiry
+  rows are inserted in the same transaction as the job status update, and
+  `waiting` rows in the transaction of the scheduling pass itself. A failed
+  pass rolls everything back together — a failed dispatch never leaves an
+  orphaned history row.
+* **No duplicate waits.** A `waiting` row is written only when the job's
+  `(queue_position, blocked_reason)` differs from its latest `waiting` row,
+  so repeated ticks and repeated queries of an unchanged queue do not spam
+  the history.
+* **Blocked reasons** match `/queue/head` (`waiting_for_free_slots`,
+  `insufficient_capacity`, `no_nodes_configured`), plus
+  `queued_behind_head` for non-head jobs held back by the head's
+  reservation.
+
+Example — a job that waited for slots, then ran to expiry:
+
+```json
+{
+  "job_id": "plate-002",
+  "events": [
+    {"seq": 3, "event_type": "queued",     "status": "queued",  "queue_position": 1, "blocked_reason": null, ...},
+    {"seq": 4, "event_type": "waiting",    "status": "queued",  "queue_position": 1, "blocked_reason": "waiting_for_free_slots", ...},
+    {"seq": 9, "event_type": "dispatched", "status": "running", "node_id": "farm-1", "slots": 5, ...},
+    {"seq": 12, "event_type": "expired",   "status": "expired", "node_id": "farm-1", "slots": 5, ...}
+  ]
+}
+```
+
+### History demo (also clickable in `/docs`)
+
+Start the stack with `docker compose up --build -d`, then:
+
+```bash
+# 1. Waiting: the 5-slot head cannot start while plate-001 holds 2 slots
+curl -s -X POST localhost:8000/nodes -H 'content-type: application/json' \
+  -d '{"node_id":"farm-1","capacity":6}'
+curl -s -X POST localhost:8000/jobs -H 'content-type: application/json' \
+  -d '{"job_id":"plate-001","required_slots":2,"max_duration_seconds":120}'
+curl -s -X POST localhost:8000/jobs -H 'content-type: application/json' \
+  -d '{"job_id":"plate-002","required_slots":5,"max_duration_seconds":30}'
+curl -s localhost:8000/jobs/plate-002/history
+# -> queued (pos 1) + waiting (pos 1, waiting_for_free_slots); repeating
+#    ticks/queries adds no further waiting rows
+
+# 2. Backfill: a short 2-slot job runs immediately without delaying the head
+curl -s -X POST localhost:8000/jobs -H 'content-type: application/json' \
+  -d '{"job_id":"preview-001","required_slots":2,"max_duration_seconds":5}'
+curl -s localhost:8000/jobs/preview-001/history   # -> queued, dispatched
+
+# 3. Expiry + release: the reaper expires preview-001 (~5s); releasing
+#    plate-001 lets the head dispatch once enough slots are free
+curl -s localhost:8000/jobs/preview-001/history   # -> ... expired
+curl -s -X POST localhost:8000/jobs/plate-001/release
+curl -s localhost:8000/jobs/plate-001/history     # -> ... released
+curl -s localhost:8000/jobs/plate-002/history     # -> ... dispatched (later: expired)
+
+# 4. Failure rollback: arm dispatch failures, then free slots — the release
+#    commits but every dispatch of plate-004 rolls back
+curl -s -X POST localhost:8000/jobs -H 'content-type: application/json' \
+  -d '{"job_id":"plate-003","required_slots":6,"max_duration_seconds":120}'
+curl -s -X POST localhost:8000/jobs -H 'content-type: application/json' \
+  -d '{"job_id":"plate-004","required_slots":4,"max_duration_seconds":30}'
+curl -s -X POST localhost:8000/admin/fault-injection \
+  -H 'content-type: application/json' -d '{"dispatch_failures":100}'
+curl -s -X POST localhost:8000/jobs/plate-003/release   # commits: completed
+curl -s localhost:8000/jobs/plate-004                   # still queued, 6 slots free
+curl -s localhost:8000/jobs/plate-004/history
+# -> only queued + waiting: the failed attempts left no orphaned rows
+curl -s -X POST localhost:8000/admin/fault-injection \
+  -H 'content-type: application/json' -d '{"dispatch_failures":0}'
+curl -s -X POST localhost:8000/admin/tick
+curl -s localhost:8000/jobs/plate-004/history           # -> exactly one dispatched
+```
+
+`POST /admin/fault-injection` exists only to demonstrate and test rollback;
+`{"dispatch_failures": 0}` disarms it. It is in-memory and per-process.
+
+---
+
 ## Implementation map
 
 ```
-app/db.py          SQLite schema, transactions, invariant triggers
-app/scheduler.py   FIFO + backfill policy, leases, expiry, head estimate
+app/db.py          SQLite schema, transactions, invariant triggers, job_events
+app/scheduler.py   FIFO + backfill policy, leases, expiry, head estimate,
+                   scheduling history (same-transaction event writes, dedupe)
 app/models.py      Pydantic request/response models (drives /docs)
 app/main.py        FastAPI routes, error mapping, background reaper
-tests/             38 tests: policy, leases, rollback, concurrency, HTTP, SQL
+tests/             58 tests: policy, leases, rollback, concurrency, HTTP, SQL,
+                   scheduling history (dedupe, restart, fault injection)
 Dockerfile         production image (non-root, healthcheck)
 Dockerfile.test    image that runs pytest
 docker-compose.yml single service + named volume for the SQLite file
